@@ -1,4 +1,4 @@
-import { VoiceChat } from '@/components/voice-chat';
+import { VoiceChat } from "@/components/voice-chat";
 
 export default function Home() {
   return (
