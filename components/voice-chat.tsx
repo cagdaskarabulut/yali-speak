@@ -28,6 +28,7 @@ export function VoiceChat({ roomId }: VoiceChatProps) {
   const socketRef = useRef<any>();
   const streamRef = useRef<MediaStream>();
   const peersRef = useRef<{ [key: string]: SimplePeer.Instance }>({});
+  const audioRefs = useRef<{ [key: string]: HTMLAudioElement }>({});
   const router = useRouter();
 
   const { toast } = useToast();
@@ -38,7 +39,13 @@ export function VoiceChat({ roomId }: VoiceChatProps) {
     socketRef.current = io(SOCKET_SERVER);
 
     navigator.mediaDevices
-      .getUserMedia({ audio: true })
+      .getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      })
       .then((stream) => {
         streamRef.current = stream;
         joinRoom();
@@ -52,31 +59,61 @@ export function VoiceChat({ roomId }: VoiceChatProps) {
       });
 
     return () => {
-      socketRef.current?.disconnect();
       Object.values(peersRef.current).forEach((peer) => peer.destroy());
-      streamRef.current?.getTracks().forEach((track) => track.stop());
+      Object.values(audioRefs.current).forEach((audio) => audio.remove());
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+      }
+      socketRef.current?.disconnect();
     };
   }, [roomId]);
+
+  const createPeer = (
+    userId: string,
+    stream: MediaStream,
+    initiator: boolean
+  ) => {
+    const peer = new SimplePeer({
+      initiator,
+      stream,
+      trickle: false,
+      config: {
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:global.stun.twilio.com:3478" },
+        ],
+      },
+    });
+
+    peer.on("signal", (signal) => {
+      socketRef.current.emit("signal", { userId, signal });
+    });
+
+    peer.on("stream", (remoteStream) => {
+      if (!audioRefs.current[userId]) {
+        const audio = new Audio();
+        audio.srcObject = remoteStream;
+        audio.volume = volume[0] / 100;
+        audio.autoplay = true;
+        audioRefs.current[userId] = audio;
+      }
+    });
+
+    return peer;
+  };
 
   const joinRoom = () => {
     if (!streamRef.current || !roomId) return;
 
     socketRef.current.emit("join-room", roomId);
 
+    socketRef.current.on("users-in-room", (users: string[]) => {
+      setConnectedPeers(users.filter((id) => id !== socketRef.current.id));
+    });
+
     socketRef.current.on("user-joined", (userId: string) => {
-      const peer = new SimplePeer({
-        initiator: true,
-        stream: streamRef.current,
-        trickle: false,
-      });
-
-      peer.on("signal", (signal) => {
-        socketRef.current.emit("signal", { userId, signal });
-      });
-
-      peer.on("stream", handleStream);
+      const peer = createPeer(userId, streamRef.current!, true);
       peersRef.current[userId] = peer;
-      setConnectedPeers((prev) => [...prev, userId]);
 
       toast({
         title: "New User",
@@ -88,47 +125,31 @@ export function VoiceChat({ roomId }: VoiceChatProps) {
       if (peersRef.current[userId]) {
         peersRef.current[userId].destroy();
         delete peersRef.current[userId];
-        setConnectedPeers((prev) => prev.filter((id) => id !== userId));
-
-        toast({
-          title: "User Left",
-          description: "A user has left the room.",
-        });
       }
+      if (audioRefs.current[userId]) {
+        audioRefs.current[userId].remove();
+        delete audioRefs.current[userId];
+      }
+      setConnectedPeers((prev) => prev.filter((id) => id !== userId));
+
+      toast({
+        title: "User Left",
+        description: "A user has left the room.",
+      });
     });
 
     socketRef.current.on(
       "receive-signal",
       ({ userId, signal }: { userId: string; signal: any }) => {
         if (!peersRef.current[userId]) {
-          const peer = new SimplePeer({
-            initiator: false,
-            stream: streamRef.current,
-            trickle: false,
-          });
-
-          peer.on("signal", (signal) => {
-            socketRef.current.emit("signal", { userId, signal });
-          });
-
-          peer.on("stream", handleStream);
-          peer.signal(signal);
+          const peer = createPeer(userId, streamRef.current!, false);
           peersRef.current[userId] = peer;
-          setConnectedPeers((prev) => [...prev, userId]);
-        } else {
-          peersRef.current[userId].signal(signal);
         }
+        peersRef.current[userId].signal(signal);
       }
     );
 
     setIsConnected(true);
-  };
-
-  const handleStream = (stream: MediaStream) => {
-    const audio = new Audio();
-    audio.srcObject = stream;
-    audio.volume = volume[0] / 100;
-    audio.play();
   };
 
   const toggleMute = () => {
@@ -142,11 +163,9 @@ export function VoiceChat({ roomId }: VoiceChatProps) {
 
   const handleVolumeChange = (newVolume: number[]) => {
     setVolume(newVolume);
-    const audioElements = document.getElementsByTagName("audio");
-    for (let i = 0; i < audioElements.length; i++) {
-      const audio = audioElements[i];
+    Object.values(audioRefs.current).forEach((audio) => {
       audio.volume = newVolume[0] / 100;
-    }
+    });
   };
 
   const copyRoomId = async () => {
@@ -169,6 +188,8 @@ export function VoiceChat({ roomId }: VoiceChatProps) {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
     }
+    Object.values(peersRef.current).forEach((peer) => peer.destroy());
+    Object.values(audioRefs.current).forEach((audio) => audio.remove());
     socketRef.current?.disconnect();
     router.push("/");
   };
@@ -247,7 +268,7 @@ export function VoiceChat({ roomId }: VoiceChatProps) {
 
           <div className="flex items-center justify-between space-x-4">
             <Label>Noise Suppression</Label>
-            <Switch />
+            <Switch defaultChecked />
           </div>
         </div>
 
